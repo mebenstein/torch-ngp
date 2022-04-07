@@ -272,7 +272,8 @@ __global__ void kernel_composite_rays_train_forward(
         // minimal remained transmittence
         if (T < 1e-4f) break;
 
-        const scalar_t alpha = 1.0f - __expf(- sigmas[0] * deltas[0]);
+        const scalar_t delta = deltas[0];
+        const scalar_t alpha = 1.0f - __expf(- sigmas[0] * delta);
         const scalar_t weight = alpha * T;
 
         // TODO: do not calc depth in training, I don't need it...
@@ -281,6 +282,9 @@ __global__ void kernel_composite_rays_train_forward(
         r += weight * rgbs[0];
         g += weight * rgbs[1];
         b += weight * rgbs[2];
+
+        d += weight * sum_delta;
+        sum_delta += delta;
 
         T *= 1.0f - alpha;
 
@@ -294,6 +298,7 @@ __global__ void kernel_composite_rays_train_forward(
         step++;
     }
 
+    //d /= (1.0f - T) * (2 * bound * 1.73205080757) + 1e-8;
     //printf("[n=%d] rgb=(%f, %f, %f), d=%f\n", n, r, g, b, d);
 
     // mix with background
@@ -322,11 +327,13 @@ __global__ void kernel_composite_rays_train_forward(
 template <typename scalar_t>
 __global__ void kernel_composite_rays_train_backward(
     const scalar_t * __restrict__ grad,
+    const scalar_t * __restrict__ grad_depth,
     const scalar_t * __restrict__ sigmas,
     const scalar_t * __restrict__ rgbs,  
     const scalar_t * __restrict__ deltas,  
     const int * __restrict__ rays,
     const scalar_t * __restrict__ image,  
+    const scalar_t * __restrict__ depth,  
     const float bound,
     const uint32_t M, const uint32_t N,
     scalar_t * grad_sigmas,
@@ -345,6 +352,8 @@ __global__ void kernel_composite_rays_train_backward(
 
     grad += index * 3;
     image += index * 3;
+    grad_depth += index;
+    depth += index;
     sigmas += offset;
     rgbs += offset * 3;
     deltas += offset;
@@ -355,19 +364,22 @@ __global__ void kernel_composite_rays_train_backward(
     uint32_t step = 0;
     scalar_t T = 1.0f;
 
-    const scalar_t r_final = image[0], g_final = image[1], b_final = image[2];
-    scalar_t r = 0, g = 0, b = 0;
+    const scalar_t r_final = image[0], g_final = image[1], b_final = image[2], d_final = depth[0];
+    scalar_t r = 0, g = 0, b = 0, d = 0, sum_delta = 0;
 
     while (step < num_steps) {
         
         //if (T < 1e-4f) break;
 
-        const scalar_t alpha = 1.0f - __expf(- sigmas[0] * deltas[0]);
+        const scalar_t delta = deltas[0];
+        const scalar_t alpha = 1.0f - __expf(- sigmas[0] * delta);
         const scalar_t weight = alpha * T;
 
         r += weight * rgbs[0];
         g += weight * rgbs[1];
         b += weight * rgbs[2];
+
+        d += weight * sum_delta;
 
         T *= 1.0f - alpha; // this has been T(t+1)
 
@@ -379,9 +391,11 @@ __global__ void kernel_composite_rays_train_backward(
         grad_sigmas[0] = deltas[0] * (
             grad[0] * (T * rgbs[0] - (r_final - r)) + 
             grad[1] * (T * rgbs[1] - (g_final - g)) + 
-            grad[2] * (T * rgbs[2] - (b_final - b))
+            grad[2] * (T * rgbs[2] - (b_final - b)) +
+            grad_depth[0] * (T * sum_delta - (d_final - d))
         );
     
+        sum_delta += delta;
         // locate
         sigmas++;
         rgbs += 3;
@@ -451,32 +465,38 @@ void composite_rays_train_forward(at::Tensor sigmas, at::Tensor rgbs, at::Tensor
 }
 
 
-void composite_rays_train_backward(at::Tensor grad, at::Tensor sigmas, at::Tensor rgbs, at::Tensor deltas, at::Tensor rays, at::Tensor image, const float bound, const uint32_t M, const uint32_t N, at::Tensor grad_sigmas, at::Tensor grad_rgbs) {
+void composite_rays_train_backward(at::Tensor grad, at::Tensor grad_depth, at::Tensor sigmas, at::Tensor rgbs, at::Tensor deltas, at::Tensor rays, at::Tensor image, at::Tensor depth, const float bound, const uint32_t M, const uint32_t N, at::Tensor grad_sigmas, at::Tensor grad_rgbs) {
 
     CHECK_CUDA(grad);
+    CHECK_CUDA(grad_depth);
     CHECK_CUDA(sigmas);
     CHECK_CUDA(rgbs);
     CHECK_CUDA(deltas);
     CHECK_CUDA(rays);
     CHECK_CUDA(image);
+    CHECK_CUDA(depth);
     CHECK_CUDA(grad_sigmas);
     CHECK_CUDA(grad_rgbs);
 
     CHECK_CONTIGUOUS(grad);
+    CHECK_CONTIGUOUS(grad_depth);
     CHECK_CONTIGUOUS(sigmas);
     CHECK_CONTIGUOUS(rgbs);
     CHECK_CONTIGUOUS(deltas);
     CHECK_CONTIGUOUS(rays);
     CHECK_CONTIGUOUS(image);
+    CHECK_CONTIGUOUS(depth);
     CHECK_CONTIGUOUS(grad_sigmas);
     CHECK_CONTIGUOUS(grad_rgbs);
 
     CHECK_IS_FLOATING(grad);
+    CHECK_IS_FLOATING(grad_depth);
     CHECK_IS_FLOATING(sigmas);
     CHECK_IS_FLOATING(rgbs);
     CHECK_IS_FLOATING(deltas);
     CHECK_IS_INT(rays);
     CHECK_IS_FLOATING(image);
+    CHECK_IS_FLOATING(depth);
     CHECK_IS_FLOATING(grad_sigmas);
     CHECK_IS_FLOATING(grad_rgbs);
 
@@ -484,7 +504,7 @@ void composite_rays_train_backward(at::Tensor grad, at::Tensor sigmas, at::Tenso
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
     grad.scalar_type(), "composite_rays_train_backward", ([&] {
-        kernel_composite_rays_train_backward<<<div_round_up(N, N_THREAD), N_THREAD>>>(grad.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), rays.data_ptr<int>(), image.data_ptr<scalar_t>(), bound, M, N, grad_sigmas.data_ptr<scalar_t>(), grad_rgbs.data_ptr<scalar_t>());
+        kernel_composite_rays_train_backward<<<div_round_up(N, N_THREAD), N_THREAD>>>(grad.data_ptr<scalar_t>(), grad_depth.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), rays.data_ptr<int>(), image.data_ptr<scalar_t>(), depth.data_ptr<scalar_t>(), bound, M, N, grad_sigmas.data_ptr<scalar_t>(), grad_rgbs.data_ptr<scalar_t>());
     }));
 }
 
